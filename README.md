@@ -5,6 +5,11 @@ the **Krea 2 Identity Edit** LoRA. Turns Krea 2 (Raw or Turbo) into an image edi
 conditioning: the source image is injected both as VAE latent tokens (appearance) and
 into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was trained.
 
+## Model versions
+
+See [CHANGELOG.md](CHANGELOG.md) — **v1.1 is recommended** (better likeness,
+locality, and remove/replace; two honest caveats listed there).
+
 ## Installation
 
 ```bash

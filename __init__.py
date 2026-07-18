@@ -11,9 +11,13 @@ out — mirroring ai-toolkit's `predict_velocity_edit` exactly, using the model'
 Wiring:  LoadImage -> VAEEncode(source) --\
                                             Krea2EditModelPatch(model, source_latent) -> KSampler
          UNETLoader -> LoraLoaderModelOnly -/
-KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
+KSampler.latent_image <- EmptySD3LatentImage (noise). Text and optional phrase weights come
+from Krea2EditGroundedEncode.
 """
+import logging
 import math
+import re
+import types
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +28,16 @@ import comfy.utils
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import attention_pytorch, optimized_attention_masked
+
+
+logger = logging.getLogger(__name__)
+
+_PROMPT_WEIGHT_RE = re.compile(r"\(([^():]+):(-?\d*\.?\d+)\)")
+_QWEN_IM_START = 151644
+_QWEN_USER = 872
+_QWEN_NEWLINE = 198
+_QWEN_IM_END = 151645
 
 
 def _imgids(bs, frame, h_, w_, device):
@@ -54,6 +67,217 @@ def _to_4d(v):
         b, c, t, h, w = v.shape
         return v.reshape(b * t, c, h, w)
     return v
+
+
+def _parse_prompt_weights(text):
+    """Return prompt text without weight markup and its ``(phrase, weight)`` terms."""
+    terms = []
+
+    def replace(match):
+        terms.append((match.group(1).strip(), float(match.group(2))))
+        return match.group(1)
+
+    return _PROMPT_WEIGHT_RE.sub(replace, text), terms
+
+
+def _token_ids(tokenized):
+    """Read the first token batch from a ComfyUI CLIP token dictionary."""
+    key = next(iter(tokenized))
+    return [token[0] for token in tokenized[key][0]]
+
+
+def _user_content_span(ids):
+    """Locate the Qwen chat user turn inside a token-id sequence."""
+    for index in range(len(ids) - 2):
+        if (ids[index], ids[index + 1], ids[index + 2]) == (
+            _QWEN_IM_START,
+            _QWEN_USER,
+            _QWEN_NEWLINE,
+        ):
+            end = index + 3
+            while end < len(ids) and ids[end] != _QWEN_IM_END:
+                end += 1
+            return index + 3, end
+    return None, None
+
+
+def _subsequence_starts(sequence, subsequence, start, end):
+    if not subsequence:
+        return []
+    width = len(subsequence)
+    return [
+        index
+        for index in range(start, end - width + 1)
+        if sequence[index:index + width] == subsequence
+    ]
+
+
+def _phrase_token_ids(clip, phrase):
+    ids = _token_ids(clip.tokenize(phrase))
+    start, end = _user_content_span(ids)
+    return [] if start is None else ids[start:end]
+
+
+def _build_krea2_token_weights(clip, tokenized, conditioning, terms, strength):
+    """Map parsed prompt terms onto positions in Krea2's visible conditioning."""
+    if not terms:
+        return []
+
+    ids = _token_ids(tokenized)
+    conditioning_length = conditioning[0][0].shape[1]
+
+    # Krea2 removes the system/user prefix from its conditioning. Image placeholders,
+    # when present, expand during encoding; the length delta accounts for that expansion.
+    visible_start = len(ids) - conditioning_length
+    content_start, content_end = _user_content_span(ids)
+    if content_start is None:
+        content_start, content_end = visible_start, len(ids)
+
+    mapped = []
+    for phrase, weight in terms:
+        if weight > 1.0:
+            value_factor = 1.0
+            attention_bias = 2.0 * strength * (weight - 1.0)
+        else:
+            value_factor = 1.0 + strength * (weight - 1.0)
+            attention_bias = 0.0
+
+        raw_positions = set()
+        # A word at the start of the prompt and the same word later in a sentence can
+        # have different Qwen BPE tokens. Check both forms and merge their matches.
+        for variant in (" " + phrase, phrase):
+            phrase_ids = _phrase_token_ids(clip, variant)
+            for match_start in _subsequence_starts(
+                ids, phrase_ids, content_start, content_end
+            ):
+                raw_positions.update(
+                    range(match_start, match_start + len(phrase_ids))
+                )
+
+        conditioning_positions = sorted(
+            position - visible_start
+            for position in raw_positions
+            if 0 <= position - visible_start < conditioning_length
+        )
+        if not conditioning_positions:
+            logger.warning(
+                "Krea2 prompt-weight phrase %r was not found; skipping it", phrase
+            )
+            continue
+
+        mapped.extend(
+            (position, value_factor, attention_bias)
+            for position in conditioning_positions
+        )
+
+    return mapped
+
+
+def _positive_conditioning_rows(transformer_options, batch_size):
+    """Expand Comfy's per-conditioning branch labels to attention batch rows."""
+    labels = transformer_options.get("cond_or_uncond")
+    if labels is None:
+        # Direct calls and older Comfy versions have no branch metadata. Preserve
+        # the original apply-to-all behavior in that compatibility path.
+        return [True] * batch_size
+    labels = list(labels)
+    if not labels or batch_size % len(labels) != 0:
+        logger.warning(
+            "Krea2 prompt weights skipped: attention batch %d cannot be mapped "
+            "to cond_or_uncond=%r",
+            batch_size,
+            labels,
+        )
+        return [False] * batch_size
+    rows_per_conditioning = batch_size // len(labels)
+    return [int(label) == 0 for label in labels for _ in range(rows_per_conditioning)]
+
+
+def _attention_mask_to_additive(mask, q):
+    """Normalize an attention mask to a broadcastable additive SDPA mask."""
+    if mask is None:
+        return None
+    if mask.dtype == torch.bool:
+        additive = q.new_zeros(mask.shape).masked_fill_(~mask, float("-inf"))
+    else:
+        additive = mask.to(device=q.device, dtype=q.dtype)
+    if additive.ndim == 1:
+        additive = additive.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    elif additive.ndim == 2:
+        additive = additive.unsqueeze(0).unsqueeze(0)
+    elif additive.ndim == 3:
+        additive = additive.unsqueeze(1)
+    elif additive.ndim != 4:
+        raise ValueError(
+            f"Krea2 attention mask must have 1-4 dimensions, got {additive.ndim}"
+        )
+    return additive
+
+
+def _weighted_krea2_attention(self, x, freqs=None, mask=None, transformer_options={}):
+    """Krea2 attention with positive-branch per-phrase prompt weighting."""
+    q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
+    q = rearrange(q, "B L (H D) -> B H L D", H=self.heads)
+    k = rearrange(k, "B L (H D) -> B H L D", H=self.kvheads)
+    v = rearrange(v, "B L (H D) -> B H L D", H=self.kvheads)
+
+    weights = transformer_options.get("krea2_token_weights")
+    positive_rows = (
+        _positive_conditioning_rows(transformer_options, v.shape[0])
+        if weights
+        else [False] * v.shape[0]
+    )
+    has_positive_rows = any(positive_rows)
+    if weights and has_positive_rows:
+        v = v.clone()
+        row_mask = v.new_tensor(positive_rows).view(v.shape[0], 1, 1)
+        for position, value_factor, _ in weights:
+            if 0 <= position < v.shape[2] and value_factor != 1.0:
+                factor = 1.0 + row_mask * (value_factor - 1.0)
+                v[:, :, position] = v[:, :, position] * factor
+
+    q, k = self.qknorm(q, k)
+    if freqs is not None:
+        q, k = apply_rope(q, k, freqs)
+    if self.kvheads != self.heads:
+        repeats = self.heads // self.kvheads
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
+
+    has_prompt_bias = (
+        weights
+        and has_positive_rows
+        and any(bias != 0.0 for _, _, bias in weights)
+    )
+    if has_prompt_bias:
+        # (batch, heads=1, queries=1, keys) broadcasts across every head and
+        # query while leaving neutral/unconditional rows unchanged.
+        prompt_bias = q.new_zeros((q.shape[0], 1, 1, k.shape[2]))
+        row_bias = q.new_tensor(positive_rows).view(q.shape[0], 1, 1)
+        for position, _, bias in weights:
+            if 0 <= position < prompt_bias.shape[-1] and bias != 0.0:
+                prompt_bias[..., position].add_(row_bias * bias)
+
+        additive_mask = _attention_mask_to_additive(mask, q)
+        if additive_mask is not None:
+            prompt_bias = prompt_bias + additive_mask
+
+        # Positive emphasis needs an additive logit bias. PyTorch SDPA accepts it
+        # directly; other configured attention backends do not do so consistently.
+        out = attention_pytorch(
+            q, k, v, self.heads, mask=prompt_bias, skip_reshape=True
+        )
+    else:
+        out = optimized_attention_masked(
+            q,
+            k,
+            v,
+            self.heads,
+            mask=mask,
+            skip_reshape=True,
+            transformer_options=transformer_options,
+        )
+    return self.wo(out * torch.sigmoid(gate))
 
 
 def _fit_src(src, H, W):
@@ -268,16 +492,17 @@ class Krea2EditModelPatch:
             "vae": ("VAE", {"tooltip": "RECOMMENDED with source_image: enables the blur-proof pixel-space path (crop+resize in pixels, encode internally) — immune to input/output resolution mismatches"}),
             "source_image": ("IMAGE", {"tooltip": "source as IMAGE (with vae connected): overrides source_latent with exact pixel-space fitting — fixes blurry results from mismatched resolutions"}),
             "source_image_b": ("IMAGE", {"tooltip": "2nd reference as IMAGE (with vae)"}),
+            "prompt_weights": ("KREA2_PROMPT_WEIGHTS", {"tooltip": "Connect Krea2 Edit (grounded encode).prompt_weights to enable positive-branch (phrase:weight) syntax"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Adds the krea2_edit in-context source-preservation path (source latent as frame=1 tokens) to a Krea2 model."
+    DESCRIPTION = "Adds the krea2_edit source-preservation path, reference-fidelity controls, and optional grounded phrase weights to Krea2."
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, fit_mode="fit"):
+              source_image_b=None, fit_mode="fit", prompt_weights=None):
         m = model.clone()
         # The target latent reaches the diffusion model already scaled (process_latent_in);
         # scale the source(s) the same way so all share one latent space.
@@ -313,10 +538,23 @@ class Krea2EditModelPatch:
                                    pos_mode=("stride1" if fit_mode == "fit" else "anchor"))
             return v
 
-        to = m.model_options.setdefault("transformer_options", {})
+        to = m.model_options.get("transformer_options", {}).copy()
+        m.model_options["transformer_options"] = to
         comfy.patcher_extension.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit", wrapper, to
         )
+
+        if prompt_weights:
+            to["krea2_token_weights"] = prompt_weights
+            diffusion_model = m.get_model_object("diffusion_model")
+            for index, block in enumerate(diffusion_model.blocks):
+                patched_attention = types.MethodType(
+                    _weighted_krea2_attention, block.attn
+                )
+                m.add_object_patch(
+                    f"diffusion_model.blocks.{index}.attn.forward",
+                    patched_attention,
+                )
         return (m,)
 
 
@@ -334,6 +572,9 @@ class Krea2EditGroundedEncode:
     with 384-768px jitter, so 640-768 is in-distribution; 0 = native res (the jitter
     training makes that tolerable too). For CFG, ground the NEGATIVE too: second node,
     empty prompt, same image (matches training's unconditional).
+
+    ``(phrase:weight)`` markup can be emitted through the second output and connected
+    to Krea2EditModelPatch. It affects only positive/edit conditioning rows.
     """
     DEFAULT_SYSTEM = (
         "Describe the image by detailing the color, shape, size, "
@@ -368,13 +609,16 @@ class Krea2EditGroundedEncode:
                                           "tooltip": "cap longest side fed to Qwen3-VL; 0 = native"}),
                 "system_prompt": ("STRING", {"multiline": True, "default": "",
                                               "tooltip": "advanced (optional): override the grounding system prompt (empty = training default). Steers what the vision encoder attends to, e.g. facial identity detail."}),
+                "weight_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05,
+                                                "tooltip": "Global strength for positive-branch (phrase:weight); connect prompt_weights to the source patch"}),
             },
         }
 
-    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_TYPES = ("CONDITIONING", "KREA2_PROMPT_WEIGHTS")
+    RETURN_NAMES = ("conditioning", "prompt_weights")
     FUNCTION = "encode"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Encodes the edit instruction grounded on the source image (training-matched semantic path)."
+    DESCRIPTION = "Encodes a grounded edit instruction and emits optional positive-branch per-phrase prompt weights."
 
     KREA2_EDIT_TEMPLATE_2REF = (
         "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
@@ -392,16 +636,26 @@ class Krea2EditGroundedEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt=""):
+    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768,
+               system_prompt="", weight_strength=1.0):
+        clean_prompt, terms = _parse_prompt_weights(prompt)
         if image is None:  # text-only fallback = old behavior
-            tokens = clip.tokenize(prompt)
-            return (clip.encode_from_tokens_scheduled(tokens),)
+            tokens = clip.tokenize(clean_prompt)
+            conditioning = clip.encode_from_tokens_scheduled(tokens)
+            weights = _build_krea2_token_weights(
+                clip, tokens, conditioning, terms, weight_strength
+            )
+            return conditioning, weights
         imgs = [self._prep(image, grounding_px)]
         if image_b is not None:
             imgs.append(self._prep(image_b, grounding_px))
         template = self._template(len(imgs), system_prompt)
-        tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
-        return (clip.encode_from_tokens_scheduled(tokens),)
+        tokens = clip.tokenize(clean_prompt, images=imgs, llama_template=template)
+        conditioning = clip.encode_from_tokens_scheduled(tokens)
+        weights = _build_krea2_token_weights(
+            clip, tokens, conditioning, terms, weight_strength
+        )
+        return conditioning, weights
 
 
 NODE_CLASS_MAPPINGS = {

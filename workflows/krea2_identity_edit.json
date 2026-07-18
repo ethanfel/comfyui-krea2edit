@@ -2,7 +2,7 @@
   "id": "krea2-identity-edit-unified",
   "revision": 0,
   "last_node_id": 110,
-  "last_link_id": 26,
+  "last_link_id": 27,
   "nodes": [
     {
       "id": 29,
@@ -452,6 +452,12 @@
           "shape": 7,
           "type": "IMAGE",
           "link": 20
+        },
+        {
+          "name": "prompt_weights",
+          "shape": 7,
+          "type": "KREA2_PROMPT_WEIGHTS",
+          "link": 27
         }
       ],
       "outputs": [
@@ -606,6 +612,13 @@
           "links": [
             22
           ]
+        },
+        {
+          "name": "prompt_weights",
+          "type": "KREA2_PROMPT_WEIGHTS",
+          "links": [
+            27
+          ]
         }
       ],
       "properties": {
@@ -614,7 +627,8 @@
       "widgets_values": [
         "Change her outfit to a red raincoat.",
         768,
-        ""
+        "",
+        1.0
       ]
     },
     {
@@ -659,6 +673,11 @@
           "links": [
             23
           ]
+        },
+        {
+          "name": "prompt_weights",
+          "type": "KREA2_PROMPT_WEIGHTS",
+          "links": null
         }
       ],
       "title": "negative (leave empty)",
@@ -668,7 +687,8 @@
       "widgets_values": [
         "",
         768,
-        ""
+        "",
+        1.0
       ]
     },
     {
@@ -1174,6 +1194,14 @@
       29,
       0,
       "IMAGE"
+    ],
+    [
+      27,
+      84,
+      1,
+      79,
+      7,
+      "KREA2_PROMPT_WEIGHTS"
     ]
   ],
   "groups": [

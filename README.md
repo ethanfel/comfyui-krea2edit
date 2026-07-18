@@ -39,6 +39,8 @@ in-context tokens (RoPE frame 1). Inputs:
   the v1/v1.1-legacy geometry (use with older weights).
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
   reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
+- `prompt_weights` *(optional)* — connect the matching output from
+  `Krea2EditGroundedEncode` to enable per-phrase weights.
 
 ### `Krea2EditGroundedEncode`
 Image-grounded instruction encoding — the text encoder *sees* the image while
@@ -50,6 +52,34 @@ reading your instruction, exactly as during training. Inputs:
 - `grounding_px` — grounding resolution (default 768; trained range 512–1536).
   This is a quality dial: lower = stronger edit adherence, higher = stronger
   identity/likeness. Try 1024+ for people, 512 for stubborn scene changes.
+- `weight_strength` — global multiplier for `(phrase:weight)` effects (default 1.0).
+
+The first output remains the grounded `CONDITIONING`. The second output carries
+the token positions and weights for `Krea2EditModelPatch.prompt_weights`.
+
+### Prompt weights
+
+Use `(phrase:weight)` inside the grounded prompt, then connect
+`Krea2EditGroundedEncode.prompt_weights` to `Krea2EditModelPatch.prompt_weights`:
+
+```text
+make the jacket (deep red:1.5) and suppress the (background crowd:-1)
+```
+
+- `weight > 1` emphasizes the phrase with attention-logit bias.
+- `weight <= 1` scales its attention value; negative values can suppress or
+  subtract a concept.
+- `weight_strength` scales the effect globally. The change compounds through
+  all Krea 2 transformer blocks, so start at 1.0 or lower.
+- Positive emphasis uses PyTorch attention so it can apply an additive bias;
+  it may use more VRAM than your configured optimized attention backend.
+
+Prompt weights apply only to the positive conditioning rows, so they are safe at
+CFG values above 1 and do not alter the grounded negative branch.
+
+This is an independent grounded adaptation of the experimental approach introduced
+by KJNodes in commits [`1271209`](https://github.com/kijai/ComfyUI-KJNodes/commit/1271209845da1e463f63ba9e9dadd81fa49986d9)
+and [`780930c`](https://github.com/kijai/ComfyUI-KJNodes/commit/780930c1b4b6df347080f1f36d2845c4437358b2).
 
 **Both nodes are required.** With a stock `CLIPTextEncode` the model never sees the
 image semantically and quality drops sharply, especially for scene-referential
@@ -61,6 +91,7 @@ instructions ("the man on the left").
 LoadImage ─┬─ VAEEncode ── Krea2EditModelPatch.source_latent
            └─ Krea2EditGroundedEncode.image     (+ your prompt)
 UNETLoader ── LoraLoaderModelOnly (krea2_identity_edit_v1_2 @1.0) ── Krea2EditModelPatch.model
+Krea2EditGroundedEncode.prompt_weights ── Krea2EditModelPatch.prompt_weights
 Krea2EditModelPatch ── KSampler.model
 Krea2EditGroundedEncode ── KSampler.positive
 Krea2EditGroundedEncode (empty prompt, same image) ── KSampler.negative
@@ -90,6 +121,9 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
 7. **Two people with distinct faces:** chain single-ref inserts (place person A,
    then run a second edit adding person B from their reference) — currently more
    face-faithful than one two-ref pass.
+8. **Prompt weights target only the positive branch.** Connect the positive grounded
+   encoder's `prompt_weights` output to the source patch. The negative encoder's
+   output stays disconnected, including in Raw/CFG > 1 workflows.
 
 ## License / credits
 

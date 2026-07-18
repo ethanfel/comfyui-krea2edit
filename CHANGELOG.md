@@ -38,6 +38,8 @@ dataset — big thanks for making it available.
 ### Node changes (technical)
 - `fit_mode` defaults to `fit` (training-matched); `crop` remains for v1/v1.1-legacy weights.
 - Added `ref_boost` / `ref_boost_a` reference-fidelity dials.
+- Added optional grounded `(phrase:weight)` prompt weighting. Weights apply only
+  to positive conditioning rows, including at CFG values above 1.
 
 ## v1.1 — 2026-07-09
 

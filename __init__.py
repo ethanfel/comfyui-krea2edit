@@ -424,3 +424,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2EditModelPatch": "Krea2 Edit (source patch)",
     "Krea2EditGroundedEncode": "Krea2 Edit (grounded encode)",
 }
+
+
+def _pack_version():
+    # single source of truth = pyproject.toml, so this never drifts from the release
+    try:
+        import os, re
+        p = os.path.join(os.path.dirname(__file__), "pyproject.toml")
+        with open(p) as f:
+            m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else "unknown"
+    except Exception:
+        return "unknown"
+
+
+print(f"[krea2edit] nodes v{_pack_version()} loaded", flush=True)

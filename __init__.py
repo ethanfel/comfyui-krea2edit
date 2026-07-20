@@ -518,7 +518,19 @@ class Krea2EditModelPatch:
                   f"'vae' and 'source_image' connected (the pixel path). Falling back to the "
                   f"latent crop path.", flush=True)
 
-        def wrapper(executor, x, timesteps, context, attention_mask=None, transformer_options={}, **kwargs):
+        def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
+            # ComfyUI signature drift (2026-07-19, commit c9602625 adds ref_latents):
+            #   old: execute(x, t, ctx, attention_mask, transformer_options)
+            #   new: execute(x, t, ctx, attention_mask, ref_latents, transformer_options)
+            # Accept both: transformer_options is the trailing dict; any native
+            # ref_latents are ignored (this patch supplies its own source path).
+            transformer_options = kwargs.pop("transformer_options", None)
+            if transformer_options is None:
+                transformer_options = {}
+                for a in reversed(wargs):
+                    if isinstance(a, dict):
+                        transformer_options = a
+                        break
             dm = executor.class_obj  # the SingleStreamDiT instance
             src = src_samples
             if vae is not None and source_image is not None:
@@ -666,3 +678,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2EditModelPatch": "Krea2 Edit (source patch)",
     "Krea2EditGroundedEncode": "Krea2 Edit (grounded encode)",
 }
+
+
+def _pack_version():
+    # single source of truth = pyproject.toml, so this never drifts from the release
+    try:
+        import os, re
+        p = os.path.join(os.path.dirname(__file__), "pyproject.toml")
+        with open(p) as f:
+            m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else "unknown"
+    except Exception:
+        return "unknown"
+
+
+print(f"[krea2edit] nodes v{_pack_version()} loaded", flush=True)

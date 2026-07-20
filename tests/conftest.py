@@ -26,12 +26,30 @@ def _install_comfy_stubs():
     class WrappersMP:
         DIFFUSION_MODEL = "diffusion_model"
 
+    class WrapperExecutor:
+        """Minimal Comfy-compatible wrapper executor used by regression tests."""
+
+        def __init__(self, original, class_obj, wrappers, idx):
+            self.original = original
+            self.class_obj = class_obj
+            self.wrappers = wrappers.copy()
+            self.idx = idx
+            self.is_last = idx == len(wrappers)
+
+        def execute(self, *args, **kwargs):
+            if self.is_last:
+                return self.original(*args, **kwargs)
+            return self.wrappers[self.idx](self, *args, **kwargs)
+
     patcher_extension.WrappersMP = WrappersMP
+    patcher_extension.WrapperExecutor = WrapperExecutor
     patcher_extension.calls = []
     attention.calls = []
 
     def add_wrapper_with_key(wrapper_type, key, wrapper, options):
         patcher_extension.calls.append((wrapper_type, key, wrapper, options))
+        wrappers = options.setdefault("wrappers", {})
+        wrappers.setdefault(wrapper_type, {}).setdefault(key, []).append(wrapper)
 
     patcher_extension.add_wrapper_with_key = add_wrapper_with_key
     utils.common_upscale = lambda samples, width, height, *_args: (
